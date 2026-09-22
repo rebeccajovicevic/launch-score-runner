@@ -1,0 +1,288 @@
+# Public runner for the Monday chart pipeline. Workflow definitions only:
+# scripts, engine, config, and data live in the private data repository,
+# which is checked out at run time and receives every commit. Secrets are
+# repository secrets; nothing sensitive is stored in this repository.
+name: weekly-chart
+on:
+  schedule:
+    - cron: "30 13 * * 1"   # Mondays 13:30 UTC — backup; an external dispatcher earlier in the morning is the primary trigger
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Picks grading DRY RUN — auth + reads + compute only; publishes nothing, writes nothing"
+        type: boolean
+        default: false
+env:
+  DATA_REPO: rebeccajovicevic/Launch-score
+jobs:
+  # Safe rehearsal of the grading path: authenticates, reads, computes,
+  # prints — writes nothing. The real pipeline is skipped when checked.
+  picks-dry-run:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Secrets sanity (fail loudly on any missing/empty secret)
+        env:
+          CHK_LAUNCH_SCORE_PAT: ${{ secrets.LAUNCH_SCORE_PAT }}
+          CHK_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ok=1
+          for v in LAUNCH_SCORE_PAT SUPABASE_SERVICE_ROLE_KEY; do
+            val=$(eval "printf %s \"\$CHK_$v\"")
+            if [ -z "$val" ]; then
+              echo "::error title=Missing secret::repository secret '$v' is EMPTY or not set in launch-score-runner — the workflow references exactly this name. Add it under Settings > Secrets and variables > Actions."
+              ok=0
+            fi
+          done
+          [ "$ok" = "1" ] || exit 1
+          echo "All expected secrets present and non-empty."
+      - uses: actions/checkout@v4
+        with:
+          repository: rebeccajovicevic/Launch-score
+          token: ${{ secrets.LAUNCH_SCORE_PAT }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Grading dry run (reads + compute, zero writes)
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          WEEK=$(date -d yesterday +%G-%V)
+          echo "live slate week: $WEEK"
+          if [ ! -f "data/picks/slates/$WEEK.json" ]; then
+            echo "::error::no slate file data/picks/slates/$WEEK.json — nothing to rehearse"
+            exit 1
+          fi
+          python ingest/picks_grade.py "$WEEK" --dry-run
+  # Backup-cron idempotency guard: stands down when this week's chart is
+  # already committed today or a dispatched run is in flight. Dispatched
+  # runs always proceed. Fails open — worst case is a duplicate run,
+  # never a missed week.
+  preflight:
+    if: inputs.dry_run != true
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rebeccajovicevic/Launch-score
+          token: ${{ secrets.LAUNCH_SCORE_PAT }}
+          fetch-depth: 100
+      - name: Decide (backup cron stands down if the week is already published)
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Dispatched run — guard does not apply."
+            exit 0
+          fi
+          WEEK=$(date -d yesterday +%G-%V)
+          LAST=$(git log -1 --format=%cs -- "data/charts/$WEEK.json" || true)
+          if [ -n "$LAST" ] && [ "$LAST" = "$(date +%F)" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "STAND DOWN: chart $WEEK was already committed today ($LAST)."
+            exit 0
+          fi
+          BUSY=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/chart.yml/runs?event=workflow_dispatch&per_page=5" \
+            | python3 -c "import json,sys; rs=json.load(sys.stdin).get('workflow_runs',[]); print(sum(1 for r in rs if r.get('status') in ('queued','in_progress')))" \
+            || echo 0)
+          if [ "$BUSY" != "0" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "STAND DOWN: a dispatched weekly-chart run is queued/in progress."
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "BACKUP ENGAGED: no chart commit for $WEEK today and no dispatched run in flight."
+  compute:
+    needs: preflight
+    # dry_run is empty on schedule fires and API dispatches without inputs
+    if: needs.preflight.outputs.run == 'true' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Secrets sanity (fail loudly on any missing/empty secret)
+        env:
+          CHK_LAUNCH_SCORE_PAT: ${{ secrets.LAUNCH_SCORE_PAT }}
+          CHK_YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          CHK_APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          CHK_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CHK_VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+          CHK_VERCEL_BYPASS_SECRET: ${{ secrets.VERCEL_BYPASS_SECRET }}
+        run: |
+          ok=1
+          for v in LAUNCH_SCORE_PAT YT_API_KEY APIFY_TOKEN SUPABASE_SERVICE_ROLE_KEY VERCEL_DEPLOY_HOOK; do
+            val=$(eval "printf %s \"\$CHK_$v\"")
+            if [ -z "$val" ]; then
+              echo "::error title=Missing secret::repository secret '$v' is EMPTY or not set in launch-score-runner — the workflow references exactly this name. Add it under Settings > Secrets and variables > Actions."
+              ok=0
+            fi
+          done
+          # optional: production verify works without it unless deployment protection is on
+          [ -n "$CHK_VERCEL_BYPASS_SECRET" ] || echo "::warning title=Optional secret empty::VERCEL_BYPASS_SECRET is not set — fine unless Vercel deployment protection is enabled.
+          [ "$ok" = "1" ] || exit 1
+          echo "All expected secrets present and non-empty."
+      - uses: actions/checkout@v4
+        with:
+          repository: rebeccajovicevic/Launch-score
+          token: ${{ secrets.LAUNCH_SCORE_PAT }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      # The Monday run scores the COMPLETED week.
+      - name: Resolve chart week
+        run: echo "WEEK=$(date -d yesterday +%G-%V)" >> "$GITHUB_ENV"
+      # A full run regenerates every machine-written input; stale same-week
+      # rows would double-count and trip the engine's duplicate guard.
+      - name: Fresh week slate (drop stale same-week rows)
+        run: rm -f "data/weeks/$WEEK.csv" "data/audit/$WEEK.json"
+
+      # ================= STAGE 1: ESSENTIALS =================
+      - name: Ingest YouTube
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+        run: python ingest/youtube.py "$WEEK"
+      - name: Integrate Twitch snapshots
+        run: python ingest/twitch_weekly.py "$WEEK"
+      - name: Apify essentials (sequential)
+        timeout-minutes: 70
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: python ingest/apify_run.py "$WEEK" --stage essentials
+      - name: Ingest X
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: python ingest/x_ingest.py scrape "$WEEK"
+      - name: Follower deltas
+        run: python ingest/follower_deltas.py "$WEEK"
+      - name: Ingest Wikipedia pageviews
+        run: python ingest/wikipedia.py "$WEEK"
+      - name: Ingest press mentions
+        run: python ingest/news.py "$WEEK"
+      - name: Ingest Google Trends
+        run: python ingest/trends.py "$WEEK"
+      - name: Probe YouTube autocomplete
+        run: python ingest/autocomplete.py "$WEEK"
+      - name: Render query audit
+        run: python ingest/audit.py "$WEEK"
+      - name: Zero-guard gap verification (targeted re-scrape of held handles)
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          GH_TOKEN: ${{ secrets.LAUNCH_SCORE_PAT }}
+          GITHUB_REPOSITORY: rebeccajovicevic/Launch-score
+        run: python ingest/gap_verify.py "$WEEK"
+      - name: Re-render query audit (post gap-verification)
+        run: python ingest/audit.py "$WEEK"
+      - name: Publication guard (no fresh consumption data -> no chart)
+        run: python ingest/guard.py "$WEEK"
+      - name: Compute chart (stage 1)
+        run: |
+          PRIORS=$(ls data/charts 2>/dev/null | sed 's/\.json$//' | grep -v "^$WEEK$" | paste -sd, -)
+          python engine/score.py "$WEEK" "$PRIORS"
+          python ingest/set_provenance.py "$WEEK" "Mentions pending: this chart was computed and published on essential inputs; the stage-2 mentions scrape runs right after publication and enriches it the same morning when it succeeds."
+      - name: Settlement print (immutable, first write wins)
+        run: python ingest/settle.py "$WEEK"
+      # Grade the slate that just locked, then generate next week's slate.
+      # Auth failures are loud but deferred (see the grading gate below) so
+      # they can never block the chart publish itself.
+      - name: Grade picks against the print
+        id: grade-picks
+        continue-on-error: true
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ ! -f "data/picks/slates/$WEEK.json" ]; then
+            echo "::warning title=Picks grading::no slate for $WEEK — nothing to grade this week"
+            exit 0
+          fi
+          python ingest/picks_grade.py "$WEEK"
+      - name: Generate next slate
+        run: python ingest/picks_slate.py "$WEEK"
+      - name: Commit chart (stage 1) to the data repository
+        run: |
+          git config user.name rebeccajovicevic
+          git config user.email 307259712+rebeccajovicevic@users.noreply.github.com
+          git add data/ roster/ reports/
+          git commit -m "chart $WEEK" || echo "nothing to commit"
+          for i in 1 2 3; do
+            git push && break
+            git pull --rebase && sleep 3
+          done
+      - name: Publish site (stage 1 deploy hook)
+        env:
+          VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$VERCEL_DEPLOY_HOOK" ]; then
+            echo "::error title=Site NOT published::Chart committed, but VERCEL_DEPLOY_HOOK is unset so no rebuild was triggered."
+            exit 1
+          fi
+          RESP=$(curl -fsS -X POST "$VERCEL_DEPLOY_HOOK")
+          echo "Deploy hook fired — production rebuild queued for week $WEEK."
+          echo "Response: $RESP"
+      - name: Verify production shows the new chart (stage 1, informational)
+        continue-on-error: true
+        env:
+          VERCEL_BYPASS_SECRET: ${{ secrets.VERCEL_BYPASS_SECRET }}
+        run: bash .github/scripts/verify_production.sh "$WEEK" "$DATA_REPO"
+
+      # ================= STAGE 2: MENTIONS =================
+      # Never-blocking: the stage-1 chart above is already live.
+      - name: "Stage 2: mentions hashtag scrapes (capped, sequential)"
+        timeout-minutes: 45
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: python ingest/apify_run.py "$WEEK" --stage mentions
+      - name: "Stage 2: re-score with mentions + impact receipts"
+        run: |
+          cp "data/charts/$WEEK.json" /tmp/stage1-chart.json
+          PRIORS=$(ls data/charts 2>/dev/null | sed 's/\.json$//' | grep -v "^$WEEK$" | paste -sd, -)
+          python engine/score.py "$WEEK" "$PRIORS"
+          python ingest/mentions_impact.py "$WEEK" /tmp/stage1-chart.json
+          python ingest/set_provenance.py "$WEEK" "Mentions enriched: the stage-2 hashtag scrape landed and mentions_by_others was computed under the full current ruleset — see the chart's version field (RESULTS_PER_TAG=50). Impact receipts: reports/$WEEK-mentions-impact.md."
+      - name: "Stage 2: commit enriched chart to the data repository"
+        run: |
+          git config user.name rebeccajovicevic
+          git config user.email 307259712+rebeccajovicevic@users.noreply.github.com
+          git add data/ reports/
+          git commit -m "chart $WEEK (mentions enriched)"
+          for i in 1 2 3; do
+            git push && break
+            git pull --rebase && sleep 3
+          done
+      - name: "Stage 2: publish site (second deploy hook)"
+        env:
+          VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: |
+          RESP=$(curl -fsS -X POST "$VERCEL_DEPLOY_HOOK")
+          echo "Deploy hook fired — enriched rebuild queued for week $WEEK."
+          echo "Response: $RESP"
+      - name: "Stage 2: verify production shows the enriched chart"
+        env:
+          VERCEL_BYPASS_SECRET: ${{ secrets.VERCEL_BYPASS_SECRET }}
+        run: bash .github/scripts/verify_production.sh "$WEEK" "$DATA_REPO"
+      - name: Weekly scrape cost check
+        if: always()
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: python ingest/apify_run.py "$WEEK" --cost-check
+
+      # Deferred grading failure: the chart publishes either way, but a
+      # grading failure turns the run red — never a silent skip.
+      - name: Picks grading gate (fail the run if grading failed)
+        if: always() && steps.grade-picks.outcome == 'failure'
+        run: |
+          echo "::error title=Picks grading FAILED::The 'Grade picks against the print' step failed — see its log for the named cause. The chart published normally, but graded results were NOT written."
+          exit 1
+      - name: Alert on failure (auto-issue in the data repository)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.LAUNCH_SCORE_PAT }}
+        run: >
+          bash .github/scripts/alert_failure.sh "${{ github.workflow }}"
+          "$DATA_REPO"
+          "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          "main"
