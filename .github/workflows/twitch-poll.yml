@@ -35,11 +35,14 @@ jobs:
             echo "Dispatched run — guard does not apply."
             exit 0
           fi
-          LAST=$(git log -1 --format=%ct -- data/twitch_snapshots/ || echo 0)
-          AGE=$(( $(date +%s) - ${LAST:-0} ))
-          if [ "$AGE" -lt 600 ]; then
+          # GitHub cron is best-effort and drifts by up to an hour, so the
+          # guard is "this UTC hour already has a snapshot", not a freshness
+          # window a drifted fire would always miss.
+          LAST_HOUR=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H --format=%cd -- data/twitch_snapshots/ || true)
+          NOW_HOUR=$(date -u +%Y-%m-%dT%H)
+          if [ -n "$LAST_HOUR" ] && [ "$LAST_HOUR" = "$NOW_HOUR" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "STAND DOWN: last snapshot commit is ${AGE}s old — this hour is already polled."
+            echo "STAND DOWN: hour $NOW_HOUR already has a snapshot commit."
             exit 0
           fi
           BUSY=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
@@ -94,7 +97,16 @@ jobs:
           git commit -m "twitch snapshot $(date -u +%Y-%m-%dT%H:%MZ)" || exit 0
           for i in 1 2 3; do
             git push && exit 0
-            git pull --rebase && sleep 3
+            git fetch origin main
+            # A rebase conflict here means a concurrent poller already
+            # committed this hour's snapshot rows — our duplicate sample is
+            # redundant, so stand down cleanly instead of dying red.
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Concurrent snapshot landed for this hour — standing down; nothing lost."
+              exit 0
+            fi
+            sleep 3
           done
           git push
       - name: Alert on failure (auto-issue in the data repository)
